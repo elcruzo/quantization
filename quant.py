@@ -1,10 +1,11 @@
-"""Int8 (LLM.int8-style), NF4 (QLoRA/QDoRA), and NVFP4 hierarchical E2M1 FP4.
+"""Int8 (LLM.int8-style), NF4, and NVFP4 hierarchical E2M1 FP4.
 
 Int8: per-tensor and per-channel/row symmetric absmax, plus asymmetric zero-point.
 Fake-quant Linear and Int8Weight: store qweights, dequant on the forward.
 
 NF4 (Dettmers QLoRA): 16-level normal-quantile codebook on last-axis blocks of 64.
-NF4Weight is the frozen-base storage path QDoRA/QLoRA consumers dequant on the fly.
+NF4Weight / Int8Weight are the numpy API for a frozen quantized Linear base
+(QLoRA/QDoRA-style); adapters in other folders wire their own torch copies.
 
 NVFP4-style (NVIDIA 2025):
   x ≈ s_global * s_block * e2m1
@@ -90,7 +91,7 @@ def dequant_int8_asym(q: np.ndarray, scale: float, zp: int) -> np.ndarray:
 
 
 class Int8Weight:
-    """Per-output-channel int8 storage for Linear W ∈ R^{d_out×d_in} (QLoRA/QDoRA base)."""
+    """Per-output-channel int8 storage for Linear W ∈ R^{d_out×d_in} (QLoRA-style base API)."""
 
     def __init__(self, weight: np.ndarray):
         w = np.asarray(weight, dtype=np.float32)
@@ -194,7 +195,7 @@ def dequant_nf4(pack: dict) -> np.ndarray:
 
 
 class NF4Weight:
-    """Frozen NF4 base for QLoRA / QDoRA. Dequant on the fly; never train the codes."""
+    """Frozen NF4 Linear base API (QLoRA/QDoRA-style). Dequant on the fly; codes stay frozen."""
 
     def __init__(self, weight: np.ndarray, block: int = 64):
         w = np.asarray(weight, dtype=np.float32)

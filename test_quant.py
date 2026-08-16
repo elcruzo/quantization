@@ -180,6 +180,8 @@ def test_dequant_linear_rel_error():
     y_fp = x @ w.T
     for scheme in ("sym_tensor", "sym_channel", "asym"):
         layer = FakeQuantLinear(w, scheme=scheme)
+        assert np.issubdtype(layer.q.dtype, np.integer)
+        assert not np.allclose(layer.weight_fp(), w)
         y_q = layer.forward(x)
         rel = np.linalg.norm(y_q - y_fp) / max(np.linalg.norm(y_fp), 1e-12)
         assert rel < 0.08, f"{scheme} rel error {rel}"
