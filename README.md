@@ -46,6 +46,6 @@ E4M3 here is a **simulation** (3-bit mantissa, bias-7, clamp 448) — not a bit-
 ## Run
 
 ```bash
-python demo.py
+python main.py
 python -m pytest test_quant.py -q
 ```
