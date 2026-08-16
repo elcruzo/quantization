@@ -1,4 +1,4 @@
-"""Int8 + FP4 tests — fail if the math is wrong."""
+"""Int8 + NF4 + NVFP4 tests — fail if the math is wrong."""
 
 from __future__ import annotations
 
@@ -8,19 +8,30 @@ import pytest
 from quant import (
     E2M1_LEVELS,
     FakeQuantLinear,
+    Int8Weight,
+    NF4_LEVELS,
+    NF4Weight,
     decode_e2m1,
+    decode_nf4,
     dequant_int4_per_tensor,
     dequant_int8_asym,
+    dequant_int8_sym_channel,
+    dequant_int8_sym_row,
     dequant_int8_sym_tensor,
     dequant_mxfp4,
+    dequant_nf4,
     dequant_nvfp4,
     encode_e2m1,
+    encode_nf4,
+    make_linear_weight,
     mse,
     quant_int8_asym,
     quant_int8_sym_channel,
+    quant_int8_sym_row,
     quant_int8_sym_tensor,
     quantize_int4_per_tensor,
     quantize_mxfp4,
+    quantize_nf4,
     quantize_nvfp4,
 )
 
@@ -35,6 +46,19 @@ def test_int8_roundtrip_error_bound():
     assert np.max(np.abs(x - y)) <= scale / 2.0 + 1e-6
 
 
+def test_int8_dequant_uses_scale_not_a_cast():
+    """AGENTS: allclose(dequant, W, atol=absmax/127) and not allclose(dequant, qweight.float())."""
+    W = make_linear_weight(32, 48, rank=6, seed=11)
+    q, scale = quant_int8_sym_tensor(W)
+    rec = dequant_int8_sym_tensor(q, scale)
+    absmax = float(np.max(np.abs(W)))
+    assert np.allclose(rec, W, atol=absmax / 127.0 + 1e-5)
+    assert not np.allclose(rec, q.astype(np.float32))
+    base = Int8Weight(W)
+    assert np.allclose(base.dequant(), dequant_int8_sym_channel(base.qweight, base.scale, axis=0))
+    assert not np.allclose(base.dequant(), base.qweight.astype(np.float32))
+
+
 def test_zero_point_beats_symmetric_on_shifted():
     rng = np.random.default_rng(1)
     x = rng.uniform(10.0, 20.0, size=1024).astype(np.float32)
@@ -47,6 +71,17 @@ def test_zero_point_beats_symmetric_on_shifted():
     assert abs(float(y_a.mean()) - float(x.mean())) < 0.5
 
 
+def test_llm_int8_vectorwise_row_scales():
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(8, 64)).astype(np.float32)
+    x[0, :] *= 40.0  # one hot row must not destroy the others
+    q, scale = quant_int8_sym_row(x)
+    y = dequant_int8_sym_row(q, scale)
+    assert scale.shape == (8,)
+    assert scale[0] > 10.0 * scale[1]
+    assert np.max(np.abs(x[1] - y[1])) <= scale[1] / 2.0 + 1e-5
+
+
 def test_e2m1_encode_decode_table():
     levels = np.concatenate([-E2M1_LEVELS[1:][::-1], E2M1_LEVELS])
     codes = encode_e2m1(levels)
@@ -55,6 +90,28 @@ def test_e2m1_encode_decode_table():
     # Midpoints fall to a neighbor (either side is valid); exact levels must stick.
     assert set(E2M1_LEVELS.tolist()) <= set(np.unique(np.abs(rec)).tolist())
     assert decode_e2m1(encode_e2m1(np.array([0.0, 6.0, -6.0, 0.5]))).tolist() == [0.0, 6.0, -6.0, 0.5]
+
+
+def test_nf4_codebook_and_weight_roundtrip():
+    assert NF4_LEVELS.shape == (16,)
+    assert NF4_LEVELS[0] == -1.0 and NF4_LEVELS[-1] == 1.0 and 0.0 in NF4_LEVELS
+    assert np.allclose(decode_nf4(encode_nf4(NF4_LEVELS)), NF4_LEVELS)
+    W = make_linear_weight(24, 80, rank=5, seed=7)  # last % 64 != 0
+    pack = quantize_nf4(W, block=64)
+    last = W.shape[-1]
+    n_blocks = W.shape[0] * ((last + 63) // 64)
+    ravel_blocks = (W.size + 63) // 64
+    assert n_blocks != ravel_blocks
+    assert pack["codes"].shape == (n_blocks, 64)
+    assert int(pack["pad"]) == (64 - last % 64) % 64
+    rec = dequant_nf4(pack)
+    assert rec.shape == W.shape
+    assert not np.allclose(rec, W)
+    assert float(np.corrcoef(W.ravel(), rec.ravel())[0, 1]) > 0.9
+    levels = decode_nf4(pack["codes"])
+    assert np.min(np.abs(levels[..., None] - NF4_LEVELS), axis=-1).max() < 1e-6
+    consumer = NF4Weight(W, block=64)
+    assert np.allclose(consumer.dequant(), rec)
 
 
 def test_nvfp4_block16_beats_per_tensor_int4_on_outliers():
@@ -87,9 +144,38 @@ def test_nvfp4_blocks_along_last_dim():
     assert rec[0, 0] > 0.5
 
 
+def test_nvfp4_last_axis_e2m1_grid_and_oracle():
+    """AGENTS / e2e: last%16!=0, E2M1 grid, dequant == s_global*s_block*E2M1, corrcoef, per-block bound."""
+    W = make_linear_weight(64, 64, rank=8, seed=3)
+    W20 = W[:, :20]
+    last = W20.shape[-1]
+    assert last % 16 != 0
+    n_blocks = W20.shape[0] * ((last + 15) // 16)
+    ravel_blocks = (W20.size + 15) // 16
+    assert n_blocks != ravel_blocks
+    pack = quantize_nvfp4(W20, block=16)
+    assert pack["codes"].shape == (n_blocks, 16)
+    assert int(pack["pad"]) == (16 - last % 16) % 16
+    rec = dequant_nvfp4(pack)
+    assert rec.shape == W20.shape
+    assert not np.allclose(rec, W20)
+    assert float(np.corrcoef(W20.ravel(), rec.ravel())[0, 1]) >= 0.85
+    vals = decode_e2m1(pack["codes"]).reshape(-1, 16)
+    grid_dist = np.min(np.abs(np.abs(vals)[..., None] - E2M1_LEVELS), axis=-1)
+    assert np.all(grid_dist <= 1e-5)
+    oracle = (pack["s_global"] * pack["s_block"][:, None] * vals).reshape(W20.shape[0], -1)[:, :last]
+    assert np.allclose(rec, oracle, atol=1e-5)
+    err = np.abs(W20 - rec)
+    for i in range(W20.shape[0]):
+        for lo in range(0, last, 16):
+            hi = min(lo + 16, last)
+            am = float(np.max(np.abs(W20[i, lo:hi])))
+            assert float(np.max(err[i, lo:hi])) <= am / 6.0 * 1.5 + 1e-4
+
+
 def test_dequant_linear_rel_error():
+    w = make_linear_weight(32, 64, rank=7, seed=3)
     rng = np.random.default_rng(3)
-    w = rng.normal(0, 0.3, size=(32, 64)).astype(np.float32)
     x = rng.normal(0, 1.0, size=(8, 64)).astype(np.float32)
     y_fp = x @ w.T
     for scheme in ("sym_tensor", "sym_channel", "asym"):

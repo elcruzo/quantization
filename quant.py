@@ -1,13 +1,17 @@
-"""Int8 (symmetric / asymmetric) and NVFP4-style hierarchical E2M1 FP4.
+"""Int8 (LLM.int8-style), NF4 (QLoRA/QDoRA), and NVFP4 hierarchical E2M1 FP4.
 
-Int8: per-tensor and per-channel symmetric absmax, plus asymmetric zero-point.
-Fake-quant Linear: store qweights, dequant on the forward.
+Int8: per-tensor and per-channel/row symmetric absmax, plus asymmetric zero-point.
+Fake-quant Linear and Int8Weight: store qweights, dequant on the forward.
+
+NF4 (Dettmers QLoRA): 16-level normal-quantile codebook on last-axis blocks of 64.
+NF4Weight is the frozen-base storage path QDoRA/QLoRA consumers dequant on the fly.
 
 NVFP4-style (NVIDIA 2025):
   x ≈ s_global * s_block * e2m1
   E2M1 levels: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}
   block 16 (NVFP4) vs 32 (MXFP4)
   s_block simulated as FP8 E4M3; s_global is FP32.
+  Blocks always along the last axis (never ravel).
 """
 
 from __future__ import annotations
@@ -50,6 +54,21 @@ def dequant_int8_sym_channel(q: np.ndarray, scale: np.ndarray, axis: int = 0) ->
     return q.astype(np.float32) * scale[None, :]
 
 
+def quant_int8_sym_row(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """LLM.int8 vector-wise row scales for activations X ∈ R^{B×H}."""
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim != 2:
+        raise ValueError("row-wise quant expects a 2-D activation")
+    absmax = np.max(np.abs(x), axis=1, keepdims=True)
+    scale = np.maximum(absmax / 127.0, 1e-12)
+    q = np.clip(np.round(x / scale), -127, 127).astype(np.int8)
+    return q, scale.astype(np.float32).reshape(-1)
+
+
+def dequant_int8_sym_row(q: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    return q.astype(np.float32) * np.asarray(scale, dtype=np.float32)[:, None]
+
+
 def quant_int8_asym(x: np.ndarray) -> tuple[np.ndarray, float, int]:
     """Asymmetric uint8 with affine zero-point. x ≈ scale * (q - zp).
 
@@ -68,6 +87,20 @@ def quant_int8_asym(x: np.ndarray) -> tuple[np.ndarray, float, int]:
 
 def dequant_int8_asym(q: np.ndarray, scale: float, zp: int) -> np.ndarray:
     return np.float32(scale) * (q.astype(np.float32) - np.float32(zp))
+
+
+class Int8Weight:
+    """Per-output-channel int8 storage for Linear W ∈ R^{d_out×d_in} (QLoRA/QDoRA base)."""
+
+    def __init__(self, weight: np.ndarray):
+        w = np.asarray(weight, dtype=np.float32)
+        if w.ndim != 2:
+            raise ValueError("Int8Weight expects a 2-D Linear weight")
+        self.qweight, self.scale = quant_int8_sym_channel(w, axis=0)
+        self.shape = w.shape
+
+    def dequant(self) -> np.ndarray:
+        return dequant_int8_sym_channel(self.qweight, self.scale, axis=0)
 
 
 class FakeQuantLinear:
@@ -100,6 +133,79 @@ class FakeQuantLinear:
         if self.bias is not None:
             y = y + self.bias
         return y
+
+
+# ---------------------------------------------------------------------------
+# NF4 (QLoRA / QDoRA frozen base)
+# ---------------------------------------------------------------------------
+
+# bitsandbytes create_normal_map(offset=0.9677083, use_extra_value=True) — QLoRA paper.
+NF4_LEVELS = np.array(
+    [
+        -1.0,
+        -0.6961928009986877,
+        -0.5250730514526367,
+        -0.39491748809814453,
+        -0.28444138169288635,
+        -0.18477343022823334,
+        -0.09105003625154495,
+        0.0,
+        0.07958029955625534,
+        0.16093020141124725,
+        0.24611230194568634,
+        0.33791524171829224,
+        0.44070982933044434,
+        0.5626170039176941,
+        0.7229568362236023,
+        1.0,
+    ],
+    dtype=np.float32,
+)
+
+
+def encode_nf4(x: np.ndarray) -> np.ndarray:
+    """Nearest NF4 codebook index in 0..15 (not a float encoding)."""
+    x = np.asarray(x, dtype=np.float32)
+    return np.argmin(np.abs(x[..., None] - NF4_LEVELS), axis=-1).astype(np.uint8)
+
+
+def decode_nf4(code: np.ndarray) -> np.ndarray:
+    return NF4_LEVELS[np.asarray(code, dtype=np.int32)]
+
+
+def quantize_nf4(x: np.ndarray, block: int = 64) -> dict:
+    """QLoRA NF4: absmax-normalize last-axis blocks, store nearest NormalFloat codes."""
+    if block < 1:
+        raise ValueError("block must be >= 1")
+    blocks, shape, n, pad = _pad_blocks(x, block)
+    absmax = np.max(np.abs(blocks), axis=1)
+    scale = np.maximum(absmax, 1e-12).astype(np.float32)
+    codes = encode_nf4(blocks / scale[:, None])
+    return {"codes": codes, "absmax": scale, "shape": shape, "n": n, "block": block, "pad": pad}
+
+
+def dequant_nf4(pack: dict) -> np.ndarray:
+    vals = decode_nf4(pack["codes"]).reshape(-1, pack["block"])
+    y = pack["absmax"][:, None] * vals
+    last = pack["shape"][-1] if pack["shape"] else pack["n"]
+    width = last + int(pack.get("pad", 0))
+    y = y.reshape(-1, width)[:, :last]
+    return y.reshape(pack["shape"]).astype(np.float32)
+
+
+class NF4Weight:
+    """Frozen NF4 base for QLoRA / QDoRA. Dequant on the fly; never train the codes."""
+
+    def __init__(self, weight: np.ndarray, block: int = 64):
+        w = np.asarray(weight, dtype=np.float32)
+        if w.ndim != 2:
+            raise ValueError("NF4Weight expects a 2-D Linear weight")
+        self.block = block
+        self.pack = quantize_nf4(w, block=block)
+        self.shape = w.shape
+
+    def dequant(self) -> np.ndarray:
+        return dequant_nf4(self.pack)
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +257,7 @@ def quantize_e4m3(x: np.ndarray) -> np.ndarray:
 
 
 def _pad_blocks(x: np.ndarray, block: int) -> tuple[np.ndarray, tuple[int, ...], int, int]:
-    """Group along the last axis (NVFP4 micro-blocks), not ravel order."""
+    """Group along the last axis (NVFP4 / NF4 micro-blocks), not ravel order."""
     x = np.asarray(x, dtype=np.float32)
     if x.ndim == 0:
         x = x.reshape(1)
@@ -167,6 +273,8 @@ def _pad_blocks(x: np.ndarray, block: int) -> tuple[np.ndarray, tuple[int, ...],
 
 def quantize_nvfp4(x: np.ndarray, block: int = 16) -> dict:
     """Hierarchical NVFP4-style: per-tensor FP32 scale + per-block E4M3 scale + E2M1."""
+    if block < 1:
+        raise ValueError("block must be >= 1")
     blocks, shape, n, pad = _pad_blocks(x, block)
     absmax = np.max(np.abs(blocks), axis=1)
     s_block_raw = np.maximum(absmax / 6.0, 1e-12)
@@ -224,3 +332,14 @@ def mse(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     return float(np.mean((a - b) ** 2))
+
+
+def make_linear_weight(d_out: int, d_in: int, rank: int = 8, seed: int = 0) -> np.ndarray:
+    """Structured Linear-like weight: low-rank signal + small noise (not iid noise alone)."""
+    rng = np.random.default_rng(seed)
+    u, _ = np.linalg.qr(rng.normal(size=(d_out, rank)).astype(np.float32))
+    v, _ = np.linalg.qr(rng.normal(size=(d_in, rank)).astype(np.float32))
+    s = np.linspace(1.0, 0.05, rank, dtype=np.float32)
+    w = (u * s) @ v.T
+    w = w + 0.01 * rng.normal(size=w.shape).astype(np.float32)
+    return w.astype(np.float32)
