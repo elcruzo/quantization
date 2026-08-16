@@ -31,6 +31,11 @@ On heavy-tailed / outlier tensors a single per-tensor int4 scale is set by the o
 
 E4M3 here is a **simulation** (3-bit mantissa, bias-7, clamp 448) — not a bit-exact NVIDIA converter.
 
+## Papers on disk
+
+- [`papers/dettmers-llm-int8-2022.pdf`](papers/dettmers-llm-int8-2022.pdf) — Dettmers et al. LLM.int8() (2022) ([arXiv:2208.07339](https://arxiv.org/abs/2208.07339))
+- [`papers/dettmers-qlora-2023.pdf`](papers/dettmers-qlora-2023.pdf) — Dettmers et al. QLoRA / NF4 (2023) ([arXiv:2305.14314](https://arxiv.org/abs/2305.14314))
+
 ## Run
 
 ```bash
