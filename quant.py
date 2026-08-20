@@ -165,7 +165,7 @@ NF4_LEVELS = np.array(
 
 
 def encode_nf4(x: np.ndarray) -> np.ndarray:
-    """Nearest NF4 codebook index in 0..15 (not a float encoding)."""
+    """Nearest NF4 codebook index in 0..15."""
     x = np.asarray(x, dtype=np.float32)
     return np.argmin(np.abs(x[..., None] - NF4_LEVELS), axis=-1).astype(np.uint8)
 
@@ -258,7 +258,7 @@ def quantize_e4m3(x: np.ndarray) -> np.ndarray:
 
 
 def _pad_blocks(x: np.ndarray, block: int) -> tuple[np.ndarray, tuple[int, ...], int, int]:
-    """Group along the last axis (NVFP4 / NF4 micro-blocks), not ravel order."""
+    """Group along the last axis (NVFP4 / NF4 micro-blocks)."""
     x = np.asarray(x, dtype=np.float32)
     if x.ndim == 0:
         x = x.reshape(1)
@@ -336,7 +336,7 @@ def mse(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def make_linear_weight(d_out: int, d_in: int, rank: int = 8, seed: int = 0) -> np.ndarray:
-    """Structured Linear-like weight: low-rank signal + small noise (not iid noise alone)."""
+    """Structured Linear-like weight: low-rank signal plus small noise."""
     rng = np.random.default_rng(seed)
     u, _ = np.linalg.qr(rng.normal(size=(d_out, rank)).astype(np.float32))
     v, _ = np.linalg.qr(rng.normal(size=(d_in, rank)).astype(np.float32))
