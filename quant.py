@@ -11,8 +11,8 @@ NVFP4-style (NVIDIA 2025):
   x ≈ s_global * s_block * e2m1
   E2M1 levels: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}
   block 16 (NVFP4) vs 32 (MXFP4)
-  s_block simulated as FP8 E4M3; s_global is FP32.
-  Blocks always along the last axis (never ravel).
+  s_block on the E4M3 numeric grid (float32); s_global is FP32.
+  Blocks along the last axis.
 """
 
 from __future__ import annotations
@@ -234,7 +234,7 @@ def decode_e2m1(code: np.ndarray) -> np.ndarray:
 
 
 def quantize_e4m3(x: np.ndarray) -> np.ndarray:
-    """Nearest finite E4M3-like value (bias 7, 3-bit mantissa, max 448). Simulated as float."""
+    """Nearest finite E4M3-grid value (bias 7, 3-bit mantissa, max 448), stored as float32."""
     x = np.asarray(x, dtype=np.float32)
     sign = np.sign(x)
     sign = np.where(sign == 0, 1.0, sign)
